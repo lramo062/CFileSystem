@@ -1,8 +1,12 @@
+#include <regex.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <math.h>
 #include "LibDisk.h"
 #include "LibFS.h"
 
@@ -83,6 +87,7 @@ typedef struct _inode {
 // max number of open files is 256
 #define MAX_OPEN_FILES 256
 
+#define TOTAL_BITS (SECTOR_SIZE * 8)
 // each directory entry represents a file/directory in the parent
 // directory, and consists of a file/directory name (less than 16
 // bytes) and an integer inode number
@@ -100,11 +105,9 @@ int osErrno;
 // the name of the disk backstore file (with which the file system is booted)
 static char bs_filename[1024];
 
-/* the following functions are internal helper functions */
 
 // check magic number in the superblock; return 1 if OK, and 0 if not
-static int check_magic()
-{
+static int check_magic() {
   char buf[SECTOR_SIZE];
   if(Disk_Read(SUPERBLOCK_START_SECTOR, buf) < 0)
     return 0;
@@ -115,55 +118,132 @@ static int check_magic()
 // initialize a bitmap with 'num' sectors starting from 'start'
 // sector; all bits should be set to zero except that the first
 // 'nbits' number of bits are set to one
-static void bitmap_init(int start, int num, int nbits)
-{
+static void bitmap_init(int start, int num, int nbits) {
   /* YOUR CODE */
   char buffer[SECTOR_SIZE];
   int i;
-  // set all the buffer bits to 0 for clean-up
+
+  // set all the buffer bits to 0 for initialization
+  // &= 0 << (i % sizeof(char));
   for(i=0; i<SECTOR_SIZE; i++) {
     buffer[i] = '\0';
   }
-  for(i=0; i<nbits; i++) {
-    buffer[i/sizeof(char)] |= 1 << (i % sizeof(char));
+
+  for(i=start; i<start+num; i++) {
+    int j;
+
+    // write to the completely filled sectors
+    int written_sectors = floor(nbits / 8);
+    for(j=0; j<written_sectors; j++) {
+      buffer[j] = (unsigned char) 255;
+    }
+
+    if(nbits % 8 > 0) {
+      int last_sector_value = 0;
+      for(j=7; j>7-(nbits%8); j--) {
+	last_sector_value = last_sector_value + pow(2, j);
+      }
+      buffer[written_sectors] = (unsigned char) last_sector_value;
+    }
+    
+    for(j=written_sectors+1; j<SECTOR_SIZE; j++) {
+      buffer[j] = '\0';
+    }
+    
+    if(Disk_Write(start, buffer) < 0) { 
+      dprintf("Error writing to memory from fn: bitmap_init"); 
+    }
   }
-  if(Disk_Write(start, buffer) < 0) {
-    dprintf("Error writing to memory from fn: bitmap_init");
-  }
-  // set all the buffer bits to 0 for clean-up
-  for(i=0; i<SECTOR_SIZE; i++) {
-    buffer[i] = '\0';
-  }
-  for(i=start+1; i<num; i++) {
-    Disk_Write(i, buffer);
-  }
+
 }
 
-// set the first unused bit from a bitmap of 'nbits' bits (flip the
-// first zero appeared in the bitmap to one) and return its location;
-// return -1 if the bitmap is already full (no more zeros)
-static int bitmap_first_unused(int start, int num, int nbits)
-{
+static char *int2bin(int i) {
+	size_t bits = sizeof(int) * 2;
+    char * str = malloc(bits + 1);
+    if(!str) return NULL;
+    str[bits] = 0;
+
+    unsigned u = *(unsigned *)&i;
+    for(; bits--; u >>= 1)
+        str[bits] = u & 1 ? '1' : '0';
+		
+    return str;
+}
+
+static int bin2int(char *s) {
+	return (int) strtol(s, NULL, 2);
+}
+
+static int bitmap_first_unused(int start, int num, int nbits) {
   /* YOUR CODE */
+  int location = 0;
+  char buffer[SECTOR_SIZE];
+  int i;
+
+  for(i=start; i<start+num; i++) {
+    Disk_Read(i, buffer);
+    int j;
+
+    for(j=0; j<SECTOR_SIZE; j++) {
+      if(buffer[j] == (char) 255) {
+	  location += 8;
+      }
+
+      else {
+	  char *binary_string = int2bin((int) buffer[j]);
+	  int target_bit = 0;
+	  while(binary_string[target_bit] != '0' && target_bit < 8) {
+		  target_bit++;
+	  }
+	  binary_string[target_bit] = '1';
+	  location += target_bit;	  
+	  buffer[j] = (unsigned char) bin2int(binary_string);
+	  Disk_Write(start, buffer);
+	  return location;
+      }
+    }
+  }
   return -1;
 }
 
-// reset the i-th bit of a bitmap with 'num' sectors starting from
-// 'start' sector; return 0 if successful, -1 otherwise
-static int bitmap_reset(int start, int num, int ibit)
-{
+
+static int bitmap_reset(int start, int num, int ibit) {
   /* YOUR CODE */
-  return -1;
+  char buffer[SECTOR_SIZE];
+  int sector = ibit % 8;
+  Disk_Read(start+num, buffer);
+
+  // update value
+  char *binary_string = int2bin((int)buffer[sector]);
+  binary_string[ibit - 1] = '0';
+  buffer[sector] = (unsigned char) bin2int(binary_string);
+
+  // write new value
+  if(Disk_Write(start, buffer) < 0) { 
+      dprintf("Error resetting bitmap");
+      return -1;
+    }
+  else {
+    return 0;
+  }
 }
 
-// return 1 if the file name is illegal; otherwise, return 0; legal
-// characters for a file name include letters (case sensitive),
-// numbers, dots, dashes, and underscores; and a legal file name
-// should not be more than MAX_NAME-1 in length
-static int illegal_filename(char* name)
-{
+static int illegal_filename(char* name) {
   /* YOUR CODE */
-  return 1; 
+  char* regular_expression = "^[a-zA-Z0-9_.-]*$";
+  regex_t regex;
+  int reti;
+  
+ 
+  reti = regcomp(&regex, regular_expression, 0);
+  reti = regexec(&regex, name, 0, NULL, 0);
+  if (reti == 1) {
+    return reti;
+  }
+  else {
+    regfree(&regex);
+    return reti;
+  }
 }
 
 // return the child inode of the given file name 'fname' from the
@@ -175,8 +255,7 @@ static int illegal_filename(char* name)
 // it returns -2 is something else is wrong (such as parent is not
 // directory, or there's read error, etc.)
 static int find_child_inode(int parent_inode, char* fname,
-			    int *cached_inode_sector, char* cached_inode_buffer)
-{
+			    int *cached_inode_sector, char* cached_inode_buffer) {
   int cached_start_entry = ((*cached_inode_sector)-INODE_TABLE_START_SECTOR)*INODES_PER_SECTOR;
   int offset = parent_inode-cached_start_entry;
   assert(0 <= offset && offset < INODES_PER_SECTOR);
@@ -224,8 +303,7 @@ static int find_child_inode(int parent_inode, char* fname,
 // the last file/directory is not in its parent directory, in which
 // case, 'last_inode' points to -1; if the function returns -1, it
 // means that we cannot follow the path
-static int follow_path(char* path, int* last_inode, char* last_fname)
-{
+static int follow_path(char* path, int* last_inode, char* last_fname) {
   if(!path) {
     dprintf("... invalid path\n");
     return -1;
@@ -286,8 +364,7 @@ static int follow_path(char* path, int* last_inode, char* last_fname)
 
 // add a new file or directory (determined by 'type') of given name
 // 'file' under parent directory represented by 'parent_inode'
-int add_inode(int type, int parent_inode, char* file)
-{
+int add_inode(int type, int parent_inode, char* file) {
   // get a new inode for child
   int child_inode = bitmap_first_unused(INODE_BITMAP_START_SECTOR, INODE_BITMAP_SECTORS, INODE_BITMAP_SIZE);
   if(child_inode < 0) {
@@ -372,8 +449,7 @@ int add_inode(int type, int parent_inode, char* file)
 
 // used by both File_Create() and Dir_Create(); type=0 is file, type=1
 // is directory
-int create_file_or_directory(int type, char* pathname)
-{
+int create_file_or_directory(int type, char* pathname) {
   int child_inode;
   char last_fname[MAX_NAME];
   int parent_inode = follow_path(pathname, &child_inode, last_fname);
@@ -399,15 +475,92 @@ int create_file_or_directory(int type, char* pathname)
   }
 }
 
+static inode_t* find_inode_by_num(int num) {
+  char buffer[SECTOR_SIZE];
+  int additional_sectors = num / INODES_PER_SECTOR;
+  int start_sector = INODE_TABLE_START_SECTOR + additional_sectors;
+  int inode_index;
+  
+  if(num >= (int) INODES_PER_SECTOR) {
+    inode_index = num % INODES_PER_SECTOR; 
+  } else {
+    inode_index = num;
+  }
+
+  Disk_Read(start_sector, buffer);
+  inode_t* target = (inode_t*) (buffer + (inode_index * sizeof(inode_t)));
+  return target;
+}
+
+static inode_t* find_inode_by_path(char* path) {
+  int token; 
+  char buffer[MAX_NAME];
+  follow_path(path, &token, buffer);
+  
+  if(token != -1) {
+    inode_t* inode = find_inode_by_num(token); 
+    return inode;
+  } else {
+    return NULL;
+  }
+}
+
+static int remove_inode_dir(int parent, int child) {
+  inode_t* parent_inode = find_inode_by_num(parent);
+  int i;
+  for(i=0; i<MAX_SECTORS_PER_FILE; i++) {
+    int data = parent_inode->data[i];
+    char buffer[SECTOR_SIZE];
+    Disk_Read(data, buffer);
+    int k;
+    for(k=0; k<(int)DIRENTS_PER_SECTOR; k++){
+      dirent_t* dir = (dirent_t*)(buffer + (k*(MAX_SECTORS_PER_FILE-10)));
+      if(dir->inode == child){
+	dirent_t* empty = {0};
+	dir = empty;
+	Disk_Write(data, buffer);
+	return 0;
+      }				
+    }
+  }
+  return -1; // general error
+}
+
+static int remove_inode_file(int parent_inode, int child_inode) {
+  char buffer[SECTOR_SIZE];
+  inode_t* file = find_inode_by_num(child_inode);  
+  int i, j;
+  for(i=0; i<MAX_SECTORS_PER_FILE; i++) {
+    int sector = (unsigned char) file->data[i];
+    if(sector != 0) {
+      for(j=0; j<SECTOR_SIZE; j++) {
+	buffer[j] = '\0';
+      }
+      Disk_Write(sector, buffer);
+      bitmap_reset(2, 3, sector+1);
+    }  
+  }
+  bitmap_reset(1, 1, child_inode+1);
+  remove_inode_dir(parent_inode, child_inode);
+  return 0;
+}
+
 // remove the child from parent; the function is called by both
 // File_Unlink() and Dir_Unlink(); the function returns 0 if success,
 // -1 if general error, -2 if directory not empty, -3 if wrong type
-int remove_inode(int type, int parent_inode, int child_inode)
-{
+static int remove_inode(int type, int parent_inode, int child_inode) {
   /* YOUR CODE */
-  return -1;
+  switch(type) {
+    case 0:
+      return remove_inode_file(parent_inode, child_inode);    
+    case 1:
+      return remove_inode_dir(parent_inode, child_inode);
+    case -1:
+      return -3;
+  default : return -1; // general error
+  }
 }
-
+ 
 // representing an open file
 typedef struct _open_file {
   int inode; // pointing to the inode of the file (0 means entry not used)
@@ -416,7 +569,16 @@ typedef struct _open_file {
 } open_file_t;
 static open_file_t open_files[MAX_OPEN_FILES];
 
-// return true if the file pointed to by inode has already been open
+// return a new file descriptor not used; -1 if full
+int new_file_fd() {
+  int i;
+  for(i=0; i<MAX_OPEN_FILES; i++) {
+    if(open_files[i].inode <= 0)
+      return i;
+  }
+  return -1;
+}
+
 int is_file_open(int inode)
 {
   int i;
@@ -427,21 +589,8 @@ int is_file_open(int inode)
   return 0;
 }
 
-// return a new file descriptor not used; -1 if full
-int new_file_fd()
-{
-  int i;
-  for(i=0; i<MAX_OPEN_FILES; i++) {
-    if(open_files[i].inode <= 0)
-      return i;
-  }
-  return -1;
-}
 
-/* end of internal helper functions, start of API functions */
-
-int FS_Boot(char* backstore_fname)
-{
+int FS_Boot(char* backstore_fname) {
   dprintf("FS_Boot('%s'):\n", backstore_fname);
   // initialize a new disk (this is a simulated disk)
   if(Disk_Init() < 0) {
@@ -560,8 +709,7 @@ int FS_Boot(char* backstore_fname)
   }
 }
 
-int FS_Sync()
-{
+int FS_Sync() {
   if(Disk_Save(bs_filename) < 0) {
     // if can't write to file, something's wrong with the backstore
     dprintf("FS_Sync():\n... failed to save disk to file '%s'\n", bs_filename);
@@ -574,20 +722,33 @@ int FS_Sync()
   }
 }
 
-int File_Create(char* file)
-{
+int File_Create(char* file) {
   dprintf("File_Create('%s'):\n", file);
   return create_file_or_directory(0, file);
 }
 
-int File_Unlink(char* file)
-{
+int File_Unlink(char* file) {
   /* YOUR CODE */
+  int child; 
+  char buffer[MAX_NAME];
+  int parent = follow_path(file, &child, buffer);
+  int open = is_file_open(child);
+
+  if(open == 1) {
+    osErrno = E_FILE_IN_USE;
+    return -1;
+  }
+  
+  if(child < 1) { 
+    osErrno = E_NO_SUCH_FILE; 
+    return -1;    
+  } else if(remove_inode(0, parent, child) >= 0) { 
+    return 0;
+  }
   return -1;
 }
 
-int File_Open(char* file)
-{
+int File_Open(char* file) {
   dprintf("File_Open('%s'):\n", file);
   int fd = new_file_fd();
   if(fd < 0) {
@@ -631,26 +792,97 @@ int File_Open(char* file)
   }  
 }
 
-int File_Read(int fd, void* buffer, int size)
-{
+
+int File_Read(int fd, void* buffer, int size) {
   /* YOUR CODE */
   return -1;
 }
 
-int File_Write(int fd, void* buffer, int size)
-{
-  /* YOUR CODE */
-  return -1;
-}
-
-int File_Seek(int fd, int offset)
-{
-  /* YOUR CODE */
+int valid_file_check(int fd) {
+  open_file_t target_file = open_files[fd];
+  if(target_file.inode < 1) {
+    osErrno = E_BAD_FD;
+    return -1;   
+  } else if(fd > MAX_OPEN_FILES) {
+    osErrno = E_NO_SPACE;
+    return -1;
+  }
   return 0;
 }
 
-int File_Close(int fd)
-{
+
+int File_Write(int fd, void* buffer, int size) {
+  /* YOUR CODE */
+  open_file_t target_file = open_files[fd];
+  inode_t* target_inode = find_inode_by_num(target_file.inode);
+  int initial_position = open_files[fd].pos;
+  int valid = valid_file_check(fd);
+  int written_bytes = 0;
+  int i;
+ 
+  if(valid != 0) {
+    return -1;
+  }
+  if(size > MAX_FILE_SIZE) {
+    osErrno = E_FILE_TOO_BIG;
+    return -1;
+  }
+  
+  for(i=0; i<size/SECTOR_SIZE; i++) {
+    char temp_buffer[SECTOR_SIZE];
+    int sector_number = target_inode->data[i];
+
+    if(sector_number == 0) {
+      sector_number = bitmap_first_unused(SECTOR_BITMAP_START_SECTOR, SECTOR_BITMAP_SECTORS, SECTOR_BITMAP_SIZE);
+    }
+    
+    if(sector_number != 0) {	
+      Disk_Read(sector_number, buffer);
+      memcpy(buffer, (buffer + target_file.size), SECTOR_SIZE - target_file.size);
+      Disk_Write(sector_number, buffer);
+      written_bytes += SECTOR_SIZE - target_file.size;
+      initial_position = 0;
+    }
+    
+    else {
+      memcpy(buffer, (temp_buffer + i*SECTOR_SIZE), size);
+      written_bytes += (int) temp_buffer + i*SECTOR_SIZE;
+      Disk_Write(sector_number, buffer);
+      size = 0;
+    }
+  }
+  target_file.pos = initial_position + size;
+  return written_bytes;
+  }
+
+int File_Seek(int fd, int offset) {
+  /* YOUR CODE */
+  int i;
+  int file_is_open;
+  int fd_inode_number;
+  open_file_t temp = open_files[fd];
+  fd_inode_number = temp.inode;
+  
+  for(i=0; i<MAX_OPEN_FILES; i++) {
+    if(open_files[i].inode == fd_inode_number) {
+      file_is_open = 0;
+    }
+  }
+  
+  if(file_is_open != 0) {
+    osErrno = E_BAD_FD;
+    return -1;
+  } else if(temp.size < offset || temp.size <= 0) {
+    osErrno = E_SEEK_OUT_OF_BOUNDS;
+    return -1;
+  } else {
+    temp.pos = temp.pos + offset;
+    open_files[fd] = temp;
+    return temp.pos;
+  }   
+}
+
+int File_Close(int fd) {
   dprintf("File_Close(%d):\n", fd);
   if(0 > fd || fd > MAX_OPEN_FILES) {
     dprintf("... fd=%d out of bound\n", fd);
@@ -668,27 +900,95 @@ int File_Close(int fd)
   return 0;
 }
 
-int Dir_Create(char* path)
-{
+int Dir_Create(char* path) {
   dprintf("Dir_Create('%s'):\n", path);
   return create_file_or_directory(1, path);
 }
 
-int Dir_Unlink(char* path)
-{
-  /* YOUR CODE */
-  return -1;
-}
+static int check_valid_dir_path(char* path, char* target) {
+  int temp = strcmp(path, target); 
+  inode_t* temp_inode = find_inode_by_path(path);
 
-int Dir_Size(char* path)
-{
-  /* YOUR CODE */
+  if(temp_inode == NULL) {
+    osErrno = E_NO_SUCH_DIR;
+    return -1;
+  }
+  
+  if(temp == 0) {
+    osErrno = E_ROOT_DIR;
+    return -1;
+  }
+
+  if(temp_inode->type != 1) {
+    return -1;
+  }
+  
   return 0;
 }
 
-int Dir_Read(char* path, void* buffer, int size)
-{
+
+int Dir_Unlink(char* path) {
   /* YOUR CODE */
+  inode_t* temp_inode = find_inode_by_path(path);
+
+  if(temp_inode->size != 0) {
+    osErrno = E_DIR_NOT_EMPTY;
+    return -1;
+  }
+  
+  int valid = check_valid_dir_path(path, "/");
+  if (valid == 0) {
+    // have to get parent and child pointer bcs that's how
+    // rm inode and follow path work 
+    int temp;
+    char buffer[MAX_NAME];
+    int parent_inode = follow_path(path, &temp, buffer);
+    valid = remove_inode(1, parent_inode, temp);
+    if (valid >= 0) {
+      return 0;
+    } else return -1;   
+  }
+  else return -1;
+}
+
+int Dir_Size(char* path) {
+  /* YOUR CODE */
+  int valid = check_valid_dir_path(path, "/");
+  if(valid != 0) {
+    return -1;
+  } else {
+    inode_t* temp_inode = find_inode_by_path(path);
+    return sizeof(temp_inode->data);
+  }
+}
+
+int Dir_Read(char* path, void* buffer, int size) {
+  /* YOUR CODE */
+  int valid = check_valid_dir_path(path, "/");
+  if(valid != 0) {
+    return -1;
+  }
+  else {
+    if(size < Dir_Size(path)) {
+      osErrno = E_BUFFER_TOO_SMALL;
+      return -1;
+    }
+    inode_t* temp = find_inode_by_path(path);
+    int i;
+    for(i=0; i<MAX_SECTORS_PER_FILE; i++) {
+      char buffer[SECTOR_SIZE];
+      Disk_Read((unsigned char) temp->data[i], buffer);
+      int k;
+      for(k=0; k<(int)DIRENTS_PER_SECTOR; k++) {
+	char *file_name;
+	char *temp_buffer[MAX_NAME];
+	dirent_t* object = (dirent_t*)(buffer + k*DIRENTS_PER_SECTOR-5);
+	file_name = object->fname;
+	buffer[k] = (unsigned char) (strcat(file_name, " "));
+      }
+    }
+  }
+    
   return -1;
 }
 

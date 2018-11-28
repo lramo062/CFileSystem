@@ -1,7 +1,7 @@
 CC     = gcc
 OPTS   = -Wall -fPIC
 INCS   = 
-LIBS   = -L. -lDisk
+LIBS   = -L. -lDisk -lm
 
 SRCS   = LibFS.c 
 OBJS   = $(SRCS:.c=.o)

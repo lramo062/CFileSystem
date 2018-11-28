@@ -40,6 +40,12 @@ int main(int argc, char *argv[])
   if(Dir_Create(fn) < 0) printf("ERROR: can't create dir '%s'\n", fn);
   else printf("dir '%s' created successfully\n", fn);
 
+  printf("performing Dir_Read");
+  char buffer[30];
+  Dir_Read("/first-dir", buffer, 200);
+  printf("dir %s size before unlink is %d bytes\n", "/first-dir", Dir_Size("/first-dir"));
+
+
   fn = "/first_dir/third*dir";
   if(Dir_Create(fn) < 0) printf("ERROR: can't create dir '%s'\n", fn);
   else printf("dir '%s' created successfully\n", fn);
@@ -55,7 +61,8 @@ int main(int argc, char *argv[])
   fn = "/first-dir/second-dir";
   if(Dir_Unlink(fn) < 0) printf("ERROR: can't unlink dir '%s'\n", fn);
   else printf("dir '%s' unlinked successfully\n", fn);
-
+  printf("dir %s size is %d after unlink\n", fn, Dir_Size(fn));
+  
   fn = "/second-file";
   int fd = File_Open(fn);
   if(fd < 0) printf("ERROR: can't open file '%s'\n", fn);
